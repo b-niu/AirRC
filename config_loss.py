@@ -32,8 +32,8 @@ class TimiLoss(nn.Module):
         ce_weight: float = 1.0,
     ):
         super().__init__()
-        # Implementation details removed for simplicity
-        # Please refer to the GitHub repository for full implementation
+        # Implementation details are not included here; see the Team timi
+        # reference solution linked in the class docstring
         pass
 
     def forward(
@@ -42,9 +42,8 @@ class TimiLoss(nn.Module):
         target: torch.Tensor,
         patch_weight: torch.Tensor,
     ) -> torch.Tensor:
-        # Implementation details removed for simplicity
-        # Please refer to the GitHub repository for full implementation
-        # This is a placeholder that returns a dummy loss value
+        # Placeholder returning a dummy loss value; the full implementation is
+        # not part of this repository (see the class docstring)
         return torch.tensor(0.0, device=logits.device)
 
 
@@ -95,6 +94,22 @@ class DeepSupervisionTimiLoss(DeepSupervisionLossBase):
     def __init__(self, deep_supr_num: int, **kwargs):
         super().__init__(deep_supr_num, **kwargs)
         self.base_loss = TimiLoss(**kwargs)
+
+
+class DeepSupervisionDiceCELoss(DeepSupervisionLossBase):
+    """Deep supervision wrapper around MONAI's DiceCELoss.
+
+    This wrapper was implemented by hand when the paper was written. MONAI now
+    provides an official implementation of the same idea,
+    `monai.losses.DeepSupervisionLoss`, and we recommend using it instead of
+    this class:
+
+        DeepSupervisionLoss(DiceCELoss(...))
+    """
+
+    def __init__(self, deep_supr_num: int, **kwargs):
+        super().__init__(deep_supr_num, **kwargs)
+        self.base_loss = DiceCELoss(**kwargs)
 
 
 class PerClassLoss(nn.Module):

@@ -1,65 +1,101 @@
 # AirRC
 
-# Coarse Pulmonary Structure Segmentation Tools for CT Images
+Code accompanying the paper:
 
-This repository provides Python scripts for performing initial coarse segmentation of pulmonary airways and blood vessels from computed tomography (CT) images. These tools implement the automated pre-segmentation pipeline described in the data descriptor paper [Liu, J., Zhang, Z., Niu, B. et al. A Custom Annotated Dataset for Segmentation of Pulmonary Veins, Arteries, and Airways. *Sci Data* **12**, 1806 (2025)](https://doi.org/10.1038/s41597-025-06074-6) for generating the AirRC (Airway and Pulmonary Vessel Structural Representation in CT) dataset.
+> Liu, J., Zhang, Z., Niu, B. et al. A Custom Annotated Dataset for Segmentation of
+> Pulmonary Veins, Arteries, and Airways. *Sci Data* **12**, 1806 (2025).
+> [https://doi.org/10.1038/s41597-025-06074-6](https://doi.org/10.1038/s41597-025-06074-6)
 
-The primary goal of these scripts is to produce rough initial segmentations that can significantly expedite the manual annotation process by providing a starting point for expert radiologists. The final accuracy of segmentations for datasets like AirRC relies on subsequent meticulous manual refinement.
+These files are excerpts of the pipeline described in that paper, provided so that the
+methods can be read alongside their implementation. They cover the pre-segmentation
+algorithms, the loss functions and the two-stage training strategy. Data loading, the
+stratified splits, the augmentation transforms, the optimizer configuration and the
+sliding-window inference live outside this repository and are omitted.
 
-## Features
+## `pulmonary_structure_segmentation_tools.py` — coarse pre-segmentation
 
-*   **Airway Segmentation:**
-    *   Seed-based 3D region growing.
-    *   Two methods provided:
-        1.  `ConfidenceConnectedImageFilter` from SimpleITK. **This is the method used in the manuscript's pre-segmentation pipeline.**
-        2.  `ConnectedThresholdImageFilter` from SimpleITK, applied on HU-clamped images, followed by connected component volume filtering to remove leakage into lung parenchyma. **This is an additional alternative offered by this repository and is not part of the published pipeline.**
-    *   Preprocessing includes HU value clamping specific for airway visualization.
-    *   Optional morphological refinement (opening and closing).
-*   **Pulmonary Vessel Segmentation:**
-    *   2D slice-wise processing.
-    *   Lung field approximation using Otsu's thresholding followed by refinement steps (border clearing, hole filling, morphological smoothing).
-    *   Adaptive thresholding for vessel candidate identification based on non-lung pixel intensity, after contrast enhancement.
-    *   Outputs a 3D binary mask of potential vessel structures.
+These routines are deliberately crude. The masks they produce are far from usable as they
+are and serve only as a starting point for extensive manual correction; they reduce the
+annotation effort rather than replace it. The refinement that follows is what determines the
+final anatomical accuracy.
 
-## Script Overview
+*Airways.* A seed point is placed in the trachea and grown with SimpleITK's
+`ConfidenceConnectedImageFilter`. The volume is first clamped to `[-1000, 0]` HU so that
+lumen and lung parenchyma become comparable, and the growing is controlled by a sensitivity
+`multiplier` (3.0). A 3D opening followed by a closing with a 1-voxel radius removes
+speckle and smooths the border. A second, threshold-based variant is included as an
+alternative: `ConnectedThresholdImageFilter` on the clamped volume, followed by connected
+component volume filtering that discards leaks into the parenchyma.
 
-*   `pulmonary_structure_segmentation_tools.py`: Contains all core functions for reading images, performing airway segmentation, performing vessel segmentation, and writing output masks. Includes an example usage block (`if __name__ == "__main__":`) for demonstration.
+*Vessels.* Processed slice by slice. Each slice is clamped to `[-2000, 2000]` HU,
+normalized to 0-255, and thresholded with Otsu to obtain a first lung field. That field is
+refined with a secondary threshold equal to the mean intensity of the pixels above the Otsu
+threshold times a lung refinement factor (0.75). The mask is then cleaned by clearing border
+pixels, median filtering, dropping border-connected components, filling holes with a flood
+fill, and an erosion/dilation pair for smoothing. On the contrast-enhanced slice (factor
+1.5), the mean intensity of the non-lung pixels times a vessel adjustment factor (1.25)
+gives the adaptive threshold for vessel candidates, which are finally restricted to the lung
+mask. The 2D results are stacked back into a 3D volume.
 
-## Prerequisites
+## `config_loss.py` — loss functions
 
-*   Python 3.8+ (the manuscript pipeline was developed with Python 3.11).
-*   Required Python packages (versions used in the manuscript in parentheses):
-    *   SimpleITK (2.3.1)
-    *   NumPy
-    *   OpenCV-Python (`opencv-python`, 4.10.0)
-    *   Scikit-image (`scikit-image`, 0.24.0)
+* `TimiLoss`, the specialized lumen loss. It combines a soft Dice and cross-entropy term
+  with a focal union term that penalizes false negatives at the periphery of the airway
+  tree, with the two contributions weighted 0.5 and 1.0 (α and β in the paper). The
+  formulation follows Team timi's winning solution to the ATM'22 challenge
+  ([reference implementation](https://github.com/EndoluminalSurgicalVision-IMR/ATM-22-Related-Work/tree/main/ATM22-Challenge-Top5-Solution/team_timi));
+  only the interface and the configuration are kept here, and `forward` is a placeholder.
+* `DeepSupervisionLossBase` applies the supervision scheme of both stages: the outputs are
+  combined as a weighted sum with exponentially decaying, normalized weights.
+* `PerClassLoss` implements the class-weighted objective of Stage 2. Each foreground class
+  is turned into an independent binary problem, the airway lumen is scored with `TimiLoss`
+  and the remaining classes with a MONAI `DiceCELoss`, and the per-class results are
+  combined through `class_weights` — raising one entry concentrates the training on that
+  class. The paper uses 1.0 for the lumen and 0.5 for the others.
+* `DeepSupervisionTimiLoss`, `DeepSupervisionDiceCELoss` and `DeepSupervisionPerClassLoss`
+  wrap the above in the deep-supervision scheme, so that the two stages only differ in the
+  base loss they pass in. These wrappers were written by hand for the paper; MONAI now
+  provides an official implementation of the same idea,
+  `monai.losses.DeepSupervisionLoss`, which we recommend using instead.
 
-> **Input requirements:** the pipeline was developed and validated on CT volumes resampled to **1 mm x 1 mm x 1 mm** isotropic voxels. Please resample your scans to this spacing before running these scripts; otherwise the voxel-based kernel sizes (which are scaled relative to a 512-pixel in-plane field of view) will not behave as intended.
+## `train_stage1.py` — Stage 1, baseline model
 
-You can install the required packages using pip:
-```bash
-pip install SimpleITK numpy opencv-python scikit-image
-```
+A baseline model trained to establish a strong initial segmentation of every foreground
+structure. The backbone is a MONAI `DynUNet` with residual blocks and four deep supervision
+heads, and the objective is the weighted Deep Supervision Dice and Cross-Entropy loss
+described in the paper. Inputs are 1 mm isotropic volumes with the intensity clipping and
+z-score normalization used in the paper's preprocessing, and validation follows the
+stratified five-fold split. The reported metric is the mean Dice over the foreground classes.
 
-## Citation
+## `train_stage2.py` — Stage 2, refinement model
 
-If you use these tools or the AirRC dataset, please cite the corresponding data descriptor:
+A second model, trained for 150 epochs with two changes with respect to the baseline.
 
-> Liu, J., Zhang, Z., Niu, B. et al. A Custom Annotated Dataset for Segmentation of Pulmonary Veins, Arteries, and Airways. *Sci Data* **12**, 1806 (2025). https://doi.org/10.1038/s41597-025-06074-6
+*Objective and optimizer.* `DeepSupervisionPerClassLoss`, i.e. the class-weighted loss
+described above applied across the deep supervision outputs, with the same SGD optimizer and
+polynomial learning-rate schedule as in Stage 1.
 
-```bibtex
-@article{liu2025airrc,
-  title   = {A Custom Annotated Dataset for Segmentation of Pulmonary Veins, Arteries, and Airways},
-  author  = {Liu, Jian and Zhang, Zheng and Niu, Bing and Kang, Shuai and Ren, Juan and Wang, Lei and Xu, Kai},
-  journal = {Scientific Data},
-  volume  = {12},
-  pages   = {1806},
-  year    = {2025},
-  doi     = {10.1038/s41597-025-06074-6}
-}
-```
+*Hard case mining.* This is what actually distinguishes the refinement stage. Every case
+carries two additional maps next to image and label — a `sample_weight` and a `loss_weight`,
+assembled by `add_weight_paths` — and the transforms run in `hard_case` mode, applying the
+same random spatial deformation to all four arrays. Training therefore concentrates on the
+regions the baseline model got wrong, and the corresponding errors are given more weight in
+the loss. The weights of the baseline are loaded from the Stage 1 checkpoint before training.
 
-## Data Availability
+## Environment
 
-*   **AirRC annotations** (254 cases, 1 mm isotropic NIfTI masks plus `metadata.xlsx`): Figshare, https://doi.org/10.6084/m9.figshare.26878867 (CC BY 4.0).
-*   **Source CT images** are not redistributed here. Obtain the LUNA16 scans separately (Zenodo, https://doi.org/10.5281/zenodo.3723295 and https://doi.org/10.5281/zenodo.4121926, CC BY 4.0) and resample them to 1 mm isotropic spacing before use.
+MONAI 1.5.0 and PyTorch Lightning 2.5.2 for the training scripts, on Python 3.11. The
+pre-segmentation script was developed with SimpleITK 2.3.1, OpenCV 4.10.0 and
+scikit-image 0.24.0.
+
+## Data
+
+The AirRC annotations (254 cases, 1 mm isotropic NIfTI masks and `metadata.xlsx`) are
+available on Figshare under CC BY 4.0
+([https://doi.org/10.6084/m9.figshare.26878867](https://doi.org/10.6084/m9.figshare.26878867)).
+The source CT scans are not redistributed here; obtain them from LUNA16 and resample them to
+1 mm isotropic spacing before use.
+
+## License
+
+GPL-3.0.
